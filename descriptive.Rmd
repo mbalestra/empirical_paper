@@ -1,0 +1,188 @@
+---
+title: "Meetup Cultural Diversity"
+author: "Myeong Lee"
+date: "6/25/2018"
+output: html_document
+---
+
+```{r, echo=FALSE}
+library(jsonlite)
+library(ggmap)
+library(ggplot2)
+library(stringr)
+library(readr)
+library(dplyr)
+library(data.table)
+library(reshape2)
+library(geosphere)
+library(raster)
+library(classInt)
+library(leaflet)
+library(RColorBrewer)
+library(maptools)
+require(kohonen)
+library(deldir)
+library(spatstat)
+library(spatstat.utils)
+library(mapproj)
+library(anocva)
+library(tm)
+library(ldatuning)
+library(topicmodels)
+library(qdap)
+library(word)
+```
+
+# Basic loading
+```{r}
+setwd("/Users/myeong/git/nyu-team-project/data/")
+events <- read_delim("2017_Year_Events.csv", delim = ",",col_names = TRUE ) 
+groups = read_delim("2017_Year_Groups.csv", delim = ",",col_names = TRUE )
+
+# Select only Washington DC for testing
+events$city <- as.factor(events$city)
+events <- events[events$city == "Washington",]
+
+events["date_1"] <- lapply(events["date"],function(x) as.Date(x, "%d %B %Y"))
+events$month <- month(events$date_1)
+events$year <- year(events$date_1)
+events$day <- mday(events$date_1)
+events$date <- paste(events$year, str_pad(events$month, width=2, side="left", pad="0"), str_pad(events$day, width=2, side="left", pad="0"),sep="")
+events$date <- as.integer(events$date)
+
+```
+
+
+# Text Clearning
+```{r}
+library(tidytext)
+library(SnowballC)
+
+
+tidy_events <- events %>% dplyr::select(event_id, description)
+tidy_events$description <- gsub("<.*?>", "", tidy_events$description)
+tidy_events <- tidy_events %>% unnest_tokens("word", description)
+# tidy_events %>% count(word) %>% arrange(desc(n))
+
+data("stop_words")
+tidy_events <- tidy_events %>% anti_join(stop_words, by=c("description" = "word"))
+
+#removing numbers
+tidy_events<-tidy_events[-grep("\\b\\d+\\b", tidy_events$word),]
+
+# removing whitespaces
+tidy_events$word <- gsub("\\s+","",tidy_events$word)
+
+# Stemming
+tidy_events <- tidy_events %>% mutate_at("word", funs(wordStem((.), language="en")))
+
+# Document Term Matrix
+tidy_events_DTM <- tidy_events %>% count(event_id, word) %>% cast_dtm(event_id, word, n)
+
+```
+
+# Determining the number of K
+```{r}
+result <- FindTopicsNumber(
+  tidy_events_DTM,
+  topics = seq(from = 10, to = 100, by = 5),
+  metrics = c("Griffiths2004", "CaoJuan2009", "Arun2010", "Deveaud2014"),
+  method = "Gibbs",
+  control = list(seed = 77),
+  mc.cores = 2L,
+  verbose = TRUE
+)
+
+write.csv(result, file="../output/griffith_output.csv")
+
+FindTopicsNumber_plot(result)
+range <- result[result$topics >= 40 & result$topics <= 70,c("topics", "Griffiths2004")]
+K <- range[max(range$Griffiths2004)==range$Griffiths2004,]$topics
+
+```
+
+# Topic Modeling 
+```{r}
+
+event_topic_model<-LDA(tidy_events_DTM, k=K, control = list(seed = 321)) # 5 is random
+event_topics <- tidy(event_topic_model, matrix = "beta")
+write.csv(event_topics, file="../output/topics.csv")
+
+
+# ap_top_terms <- 
+#   AP_topics %>%
+#   group_by(topic) %>%
+#   top_n(5, beta) %>%
+#   ungroup() %>%
+#   arrange(topic, -beta)
+# 
+# ap_top_terms %>%
+#   mutate(term = reorder(term, beta)) %>%
+#   ggplot(aes(term, beta, fill = factor(topic))) +
+#   geom_col(show.legend = FALSE) +
+#   facet_wrap(~ topic, scales = "free") +
+#   coord_flip()
+```
+
+
+# Event Co-occurance matrix (temporarily working only on samples)
+```{r}
+
+sample_ids <- unique(tidy_events$event_id)
+sample_events <- events[events$event_id %in% sample_ids,] 
+sample_events$topic <- 0 
+sample_events <- sample_events %>% dplyr::select(event_id, description)
+sample_events$description <- gsub("<.*?>", "", sample_events$description)
+
+topic_table <- acast(event_topics, topic ~ term, value.var = "beta", drop=FALSE)
+
+tf_table <- as.data.frame(matrix(ncol = 0, nrow=ncol(topic_table)))
+tf_table$term <- colnames(topic_table)
+rownames(tf_table) <- tf_table$term
+
+for (i in 1:nrow(sample_events)){
+  temp <- sample_events[sample_events$event_id == sample_ids[i],]
+  temp <- temp %>% unnest_tokens("word", description)
+  temp <- temp %>% anti_join(stop_words)
+  
+  term_freq <- freq_terms(sample_events[sample_events$event_id== sample_ids[i],]$description, nrow(temp), stopwords=stop_words$word)
+  
+  term_freq <- term_freq %>% anti_join(stop_words, by=c("WORD"="word"))
+  term_freq$WORD <- gsub("\\s+","",term_freq$WORD)
+  term_freq <- term_freq %>% mutate_at("WORD", funs(wordStem((.), language="en")))
+  term_freq <- term_freq[term_freq$WORD %in% tf_table$term,]
+  term_freq <- term_freq %>% group_by(WORD) %>% summarise(FREQ=sum(FREQ))
+  
+  term_freq$FREQ <- scale(term_freq$FREQ, center=FALSE)
+  term_freq$FREQ <- as.vector(term_freq$FREQ)
+  colnames(term_freq) <- c("WORD", as.character(sample_ids[i]))
+  
+  tf_table <- tf_table %>% left_join(term_freq, by=c("term" = "WORD"))
+}
+
+tf_table[is.na(tf_table)] <- 0
+# tf_table <- tf_table[,-1]
+tf_table <- t(tf_table)
+colnames(tf_table) <- tf_table[1,]
+tf_table <- tf_table[-1,]
+tf_table <- as.data.frame(tf_table)
+tf_table <- apply(tf_table, 2, function(x) as.character(x))
+tf_table <- apply(tf_table, 2, function(x) as.numeric(x))
+
+apply_cosine_similarity <- function(df){
+  cos.sim <- function(df, ix) 
+  {
+    A = df[ix[1],]
+    B = df[ix[2],]
+    return( sum(A*B)/sqrt(sum(A^2)*sum(B^2)) )
+  }   
+  n <- nrow(df) 
+  cmb <- expand.grid(i=1:n, j=1:n) 
+  C <- matrix(apply(cmb,1,function(cmb){ cos.sim(df, cmb) }),n,n)
+  C
+}
+
+cossim <- apply_cosine_similarity(tf_table)
+
+```
+
